@@ -1,0 +1,17 @@
+# Windows-only bundled ffmpeg (too big to commit; prod installs via build.sh)
+bin/
+venv/
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Local temp download dirs created at runtime
+grab_*/
+*.part
+
+# OS
+.DS_Store
+Thumbs.db

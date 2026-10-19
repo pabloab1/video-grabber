@@ -1,0 +1,188 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Video Grabber</title>
+<style>
+  :root{
+    --bg:#101418; --panel:#182027; --line:#2a3640; --text:#e8eef2;
+    --muted:#8a9aa6; --accent:#4fd1c5; --err:#ff7a7a;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    background:var(--bg); color:var(--text);
+    font:16px/1.5 "Avenir Next","Segoe UI",system-ui,sans-serif;
+    display:flex; align-items:center; justify-content:center; padding:20px;
+  }
+  main{width:100%; max-width:560px}
+  h1{font-size:28px; margin:0 0 6px; letter-spacing:-.01em}
+  p.sub{color:var(--muted); margin:0 0 22px}
+  .box{background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:14px; display:flex; gap:10px; flex-wrap:wrap}
+  input{
+    flex:1 1 220px; min-width:0; background:transparent; border:0; outline:0;
+    color:var(--text); font:inherit; padding:10px;
+  }
+  button{
+    background:var(--accent); color:#06201d; border:0; border-radius:10px;
+    font:inherit; font-weight:600; padding:10px 20px; cursor:pointer;
+  }
+  button:disabled{opacity:.5; cursor:wait}
+  button.ghost{background:transparent; color:var(--muted); border:1px solid var(--line); font-weight:500; padding:8px 16px}
+  button.ghost:hover{color:var(--text)}
+  button:focus-visible,input:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+  .bar{height:6px; background:#0c1116; border:1px solid var(--line); border-radius:99px; overflow:hidden; margin-top:14px; display:none}
+  .bar > i{display:block; height:100%; width:0%; background:var(--accent); transition:width .3s ease}
+  #status{min-height:24px; margin-top:14px; color:var(--muted)}
+  #status.err{color:var(--err)}
+  #actions{margin-top:10px; display:none}
+</style>
+</head>
+<body>
+<main>
+  <h1>Video Grabber</h1>
+  <p class="sub">Paste a video link and download the file.</p>
+  <div class="box">
+    <input id="url" type="url" placeholder="Paste link here" autocomplete="off" aria-label="Video link">
+    <button id="go">Download</button>
+  </div>
+  <div class="bar" id="bar"><i id="fill"></i></div>
+  <div id="status" role="status" aria-live="polite"></div>
+  <div id="actions">
+    <button id="cancel" class="ghost">Cancel download</button>
+  </div>
+</main>
+<script>
+const $ = id => document.getElementById(id);
+const status = (t, err=false) => { $("status").textContent = t; $("status").className = err ? "err" : ""; };
+
+const POLL_MS = 700;
+const STALL_MS = 300000;  // no movement for 5 min -> warn
+
+let job = null, pollTimer = null, cancelling = false;
+let lastStage = "", lastPct = -1, lastMove = 0;
+
+function busy(on){
+  $("go").disabled = on;
+  $("url").disabled = on;
+  $("cancel").disabled = false;
+  $("bar").style.display = on ? "block" : "none";
+  $("actions").style.display = on ? "block" : "none";
+  if(!on) $("fill").style.width = "0%";
+}
+
+function stopPoll(){ if(pollTimer){ clearInterval(pollTimer); pollTimer = null; } }
+
+function fail(msg){
+  stopPoll();
+  status(msg, true);
+  busy(false);
+  job = null; cancelling = false;
+}
+
+async function grab(){
+  const url = $("url").value.trim();
+  if(!url){ status("Paste a link first.", true); return; }
+  busy(true);
+  cancelling = false;
+  lastStage = ""; lastPct = -1; lastMove = Date.now();
+  status("Starting…");
+  try{
+    const r = await fetch("/download", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({url})
+    });
+    const j = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(j.error || "Failed to start download.");
+    job = j.job;
+    pollTimer = setInterval(tick, POLL_MS);
+    tick();
+  }catch(e){ fail(e.message); }
+}
+
+async function tick(){
+  if(!job) return;
+  let j;
+  try{
+    const r = await fetch("/progress?job=" + encodeURIComponent(job));
+    j = await r.json().catch(()=>({}));
+    if(!r.ok) throw new Error(j.error || "Lost track of the job.");
+  }catch(e){
+    fail(e.message);
+    return;
+  }
+
+  if(cancelling){
+    if(j.status === "cancelled" || j.status === "error"){ fail("Cancelled."); return; }
+    status("Cancelling…");
+    return;
+  }
+
+  if(j.status === "done") return deliver();
+  if(j.status === "cancelled") return fail("Cancelled.");
+  if(j.status === "error") return fail(j.error || "Download failed.");
+
+  // still working: queued -> downloading -> merging
+  const pct = Math.max(0, Math.min(99, j.percent || 0));
+  const stage = j.status + (j.percent || 0);
+  if(stage !== lastStage || pct !== lastPct){
+    lastStage = stage; lastPct = pct; lastMove = Date.now();
+  }
+  $("fill").style.width = pct + "%";
+
+  if(j.status === "queued" && pct === 0){
+    status("Fetching video info…");
+  }else{
+    const extra = [j.speed && "at " + j.speed, j.eta && "ETA " + j.eta].filter(Boolean).join(" · ");
+    status("Downloading " + pct.toFixed(1) + "%" + (extra ? " — " + extra : ""));
+  }
+
+  if(Date.now() - lastMove > STALL_MS){
+    fail("No progress for 5 minutes — the site may be throttling or blocking this download. You can retry or try another link.");
+  }
+}
+
+async function deliver(){
+  stopPoll();
+  status("Preparing file…");
+  try{
+    const r = await fetch("/file?job=" + encodeURIComponent(job));
+    if(!r.ok){
+      const j = await r.json().catch(()=>({}));
+      throw new Error(j.error || "Failed to fetch the file.");
+    }
+    const name = (r.headers.get("Content-Disposition")||"").match(/filename\*?=(?:UTF-8'')?"?([^";]+)/i);
+    const blob = await r.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name ? decodeURIComponent(name[1]) : "video.mp4";
+    a.click(); URL.revokeObjectURL(a.href);
+    status("Done. Check your downloads.");
+    $("url").value = "";
+  }catch(e){ status(e.message, true); }
+  busy(false);
+  job = null;
+}
+
+async function cancel(){
+  if(!job || cancelling) return;
+  cancelling = true;
+  $("cancel").disabled = true;
+  status("Cancelling…");
+  try{
+    await fetch("/cancel", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({job})
+    });
+  }catch(e){ /* polling will settle the state either way */ }
+  // safety net: never leave the UI wedged if the job's state never lands
+  setTimeout(()=>{ if(cancelling && job) fail("Cancelled."); }, 10000);
+}
+
+$("go").onclick = grab;
+$("cancel").onclick = cancel;
+$("url").addEventListener("keydown", e => { if(e.key==="Enter") grab(); });
+</script>
+</body>
+</html>
