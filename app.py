@@ -15,11 +15,19 @@ FFMPEG_DIR = os.path.join(BASE_DIR, "bin")
 
 
 def find_ffmpeg():
-    """Prefer a bundled ffmpeg (local dev), else let yt-dlp use system ffmpeg (prod)."""
+    """Locate ffmpeg. Returns None to let yt-dlp fall back to PATH."""
+    # 1. A binary next to the app: bin/ffmpeg.exe on Windows (local dev), or
+    #    bin/ffmpeg downloaded by fetch_ffmpeg.py during a Linux build.
     for cand in ("ffmpeg.exe", "ffmpeg"):
         if os.path.exists(os.path.join(FFMPEG_DIR, cand)):
             return FFMPEG_DIR
-    return None  # fall back to ffmpeg on PATH (installed via build.sh on Render)
+    # 2. imageio-ffmpeg ships a static ffmpeg as a wheel, so it survives on any
+    #    host even if no build script ran (Render, Railway, Heroku, a plain VPS).
+    try:
+        import imageio_ffmpeg
+        return os.path.dirname(imageio_ffmpeg.get_ffmpeg_exe())
+    except Exception:
+        return None  # fall back to ffmpeg on PATH
 
 
 FFMPEG_LOCATION = find_ffmpeg()

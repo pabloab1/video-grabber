@@ -1,3 +1,6 @@
 flask==3.0.3
 yt-dlp
 gunicorn==22.0.0
+# Ships a static ffmpeg binary via pip, so the app has a working ffmpeg on any
+# host even when no build script ran. app.py falls back to it automatically.
+imageio-ffmpeg

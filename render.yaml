@@ -4,7 +4,12 @@ services:
     runtime: python
     plan: free
     buildCommand: "bash build.sh"
-    startCommand: "gunicorn --bind 0.0.0.0:$PORT --workers 2 --timeout 300 app:app"
+    # --workers 1 is REQUIRED: download jobs live in a process-local `jobs`
+    # dict, so a second worker owns a separate copy and /progress + /file polls
+    # for a job started on worker 1 would 404 on worker 2. Downloads run in
+    # their own daemon threads, so one process + threads is both correct and
+    # plenty of concurrency.
+    startCommand: "gunicorn --bind 0.0.0.0:$PORT --workers 1 --threads 8 --timeout 300 app:app"
     healthCheckPath: "/"
     envVars:
       - key: PYTHON_VERSION
