@@ -32,18 +32,45 @@ def find_ffmpeg():
 
 FFMPEG_LOCATION = find_ffmpeg()
 
-MAX_FILESIZE = 500 * 1024 * 1024  # 500 MB cap
-JOB_TTL = 600  # seconds a terminal (error/cancelled) job is kept for polling
+# --- Tunables (env-overridable so the hosted instance can be adjusted) --------
+MAX_FILESIZE = int(os.environ.get("MAX_FILESIZE_MB", "500")) * 1024 * 1024
+JOB_TTL = 600                       # keep terminal jobs this long for polling
+MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "4"))
+STALL_SECONDS = int(os.environ.get("STALL_SECONDS", "90"))
+JOB_TIMEOUT = int(os.environ.get("JOB_TIMEOUT_SECONDS", "1800"))
+FRAG_CONCURRENCY = int(os.environ.get("FRAG_CONCURRENCY", "2"))
+PROXY = os.environ.get("YDL_PROXY") or None
+COOKIE_FILE = os.environ.get("YDL_COOKIE_FILE") or None
 
-# A realistic browser UA helps with sites that reject non-browser clients.
+# Browser TLS/HTTP2 fingerprint impersonation. A plain Python client is trivially
+# detected even with a spoofed User-Agent; impersonating a real Chrome handshake
+# is what gets past most bot checks. Requires the curl_cffi package.
+try:
+    import curl_cffi  # noqa: F401
+    from yt_dlp.networking.impersonate import ImpersonateTarget
+    _IMPERSONATE = ImpersonateTarget.from_str("chrome")
+except Exception:
+    _IMPERSONATE = None
+
+# Disabled at runtime if yt-dlp rejects the target (older/newer curl_cffi).
+USE_IMPERSONATE = _IMPERSONATE is not None
+
 USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
 
 jobs = {}
 jobs_lock = threading.Lock()
 
 
 class Cancelled(Exception):
+    pass
+
+
+class Stalled(Exception):
+    pass
+
+
+class TimedOut(Exception):
     pass
 
 
@@ -57,10 +84,12 @@ def new_job(url):
     job = {
         "id": jid,
         "url": url,
-        "status": "queued",  # queued | downloading | merging | done | error | cancelled
+        "status": "queued",  # queued | downloading | done | error | cancelled
         "percent": 0.0,
         "speed": "",
         "eta": "",
+        "message": None,
+        "attempt": 0,
         "filename": None,
         "error": None,
         "path": None,
@@ -73,68 +102,207 @@ def new_job(url):
     return job
 
 
-def run_download(job):
-    tmp = tempfile.mkdtemp(prefix="grab_")
-    job["tmp"] = tmp
+# Files yt-dlp leaves behind that are not the finished media.
+TEMP_MARKERS = (".part", ".ytdl", ".temp", ".frag", ".info.json")
 
-    def hook(d):
-        if job["cancel"]:
-            raise Cancelled()
-        st = d.get("status")
-        if st == "downloading":
-            job["status"] = "downloading"
-            total = d.get("total_bytes") or d.get("total_bytes_estimate")
-            done = d.get("downloaded_bytes")
-            if total and done is not None:
-                job["percent"] = round(done / total * 100, 1)
-            job["speed"] = (d.get("_speed_str") or "").strip()
-            job["eta"] = (d.get("_eta_str") or "").strip()
-        elif st == "finished":
-            job["percent"] = 100.0
 
+def is_temp(name):
+    return any(m in name for m in TEMP_MARKERS)
+
+
+def backoff(attempt):
+    """Exponential backoff, capped. attempt is 1-based."""
+    return min(2 ** attempt, 20)
+
+
+def build_opts(job, tmp, attempt):
     opts = {
         "outtmpl": os.path.join(tmp, "%(title).80B.%(ext)s"),
-        "format": "bv*+ba/b",          # best video + audio, fall back to best single file
+        # First attempts ask for separate best video + audio (needs a merge).
+        # Later attempts fall back to a single progressive file, which survives
+        # hosts where merging fails.
+        "format": "bv*+ba/b" if attempt <= 2 else "b",
         "merge_output_format": "mp4",
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
-        "noprogress": True,            # stdout stays quiet; progress goes to the UI via the hook
+        "noprogress": True,
         "max_filesize": MAX_FILESIZE,
-        "ffmpeg_location": FFMPEG_LOCATION,  # bundled on Windows; system ffmpeg in prod
-        "concurrent_fragment_downloads": 4,  # parallel HLS/DASH fragments; single-stream CDNs crawl otherwise
-        "http_headers": {"User-Agent": USER_AGENT},
-        "progress_hooks": [hook],
+        "ffmpeg_location": FFMPEG_LOCATION,
+
+        # --- resilience: the actual fix for downloads dying partway ----------
+        "retries": 10,                 # per-request network retries
+        "fragment_retries": 10,        # per-fragment retries (HLS/DASH)
+        "extractor_retries": 5,
+        "file_access_retries": 5,
+        "retry_sleep_functions": {
+            "http": backoff,
+            "fragment": backoff,
+            "file_access": backoff,
+        },
+        "continuedl": True,            # resume .part files instead of restarting
+        "skip_unavailable_fragments": True,  # one dead fragment must not kill the job
+        # Chunked GETs: a dropped connection costs one chunk, not the whole file.
+        "http_chunk_size": 10 * 1024 * 1024,
+        "socket_timeout": 30,
+        # Fewer parallel connections = far less likely to trip rate limiting.
+        "concurrent_fragment_downloads": FRAG_CONCURRENCY,
+        "progress_hooks": [make_hook(job)],
     }
-    try:
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.extract_info(job["url"], download=True)
+
+    if PROXY:
+        opts["proxy"] = PROXY
+    if COOKIE_FILE and os.path.exists(COOKIE_FILE):
+        opts["cookiefile"] = COOKIE_FILE
+
+    if USE_IMPERSONATE:
+        # Impersonation supplies a coherent header set; overriding the UA on top
+        # of it would re-create the mismatch we are trying to avoid.
+        opts["impersonate"] = _IMPERSONATE
+    else:
+        opts["http_headers"] = {
+            "User-Agent": USER_AGENT,
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+    return opts
+
+
+def make_hook(job):
+    """Progress hook that also aborts an attempt when the transfer goes silent."""
+
+    def hook(d):
         if job["cancel"]:
             raise Cancelled()
-        files = [f for f in os.listdir(tmp) if not f.endswith(".part")]
-        if not files:
-            job["status"] = "error"
-            job["error"] = "No video found at that link."
-            return
-        files.sort(key=lambda f: os.path.getsize(os.path.join(tmp, f)), reverse=True)
-        name = files[0]
-        job["path"] = os.path.join(tmp, name)
-        job["filename"] = name
-        job["percent"] = 100.0
-        job["status"] = "done"
+        if time.time() - job["started"] > JOB_TIMEOUT:
+            raise TimedOut()
+
+        st = d.get("status")
+        if st == "downloading":
+            job["status"] = "downloading"
+            done = d.get("downloaded_bytes")
+            if done is not None and done > job.get("last_bytes", -1):
+                job["last_bytes"] = done
+                job["last_progress"] = time.time()
+            total = d.get("total_bytes") or d.get("total_bytes_estimate")
+            if total and done is not None:
+                job["percent"] = round(done / total * 100, 1)
+            job["speed"] = (d.get("_speed_str") or "").strip()
+            job["eta"] = (d.get("_eta_str") or "").strip()
+            if time.time() - job["last_progress"] > STALL_SECONDS:
+                raise Stalled()
+        elif st == "finished":
+            job["percent"] = 100.0
+
+    return hook
+
+
+def clean_error(exc):
+    """Turn yt-dlp's noisy errors into something a user can act on."""
+    msg = str(exc).split("ERROR:")[-1].strip()
+    low = msg.lower()
+    if "403" in msg or "forbidden" in low:
+        return ("The site refused the download (HTTP 403). It is blocking this "
+                "server's IP — retry later, set YDL_PROXY, or run the app locally.")
+    if "429" in msg or "too many requests" in low:
+        return ("The site rate-limited this server (HTTP 429). Wait a few "
+                "minutes and try again.")
+    if any(s in low for s in ("age-restricted", "age restricted", "confirm your age",
+                              "sign in", "log in", "login required", "premium",
+                              "members only", "private video")):
+        return ("This video needs a login or age check. Provide cookies via "
+                "YDL_COOKIE_FILE to download it.")
+    if "unsupported url" in low or "not a valid url" in low:
+        return "That link is not supported."
+    if "unable to download webpage" in low or "unable to extract" in low:
+        return "Couldn't read that page — the link may be dead or region-locked."
+    return msg[:300] or "Could not download that link."
+
+
+def finish_success(job, tmp):
+    files = [f for f in os.listdir(tmp) if not is_temp(f)]
+    if not files:
+        job["status"] = "error"
+        job["error"] = "No video found at that link."
+        return
+    files.sort(key=lambda f: os.path.getsize(os.path.join(tmp, f)), reverse=True)
+    job["path"] = os.path.join(tmp, files[0])
+    job["filename"] = files[0]
+    job["percent"] = 100.0
+    job["message"] = None
+    job["status"] = "done"
+
+
+def run_download(job):
+    global USE_IMPERSONATE
+
+    tmp = tempfile.mkdtemp(prefix="grab_")
+    job["tmp"] = tmp
+    job["started"] = time.time()
+    job["last_progress"] = time.time()
+    job["last_bytes"] = -1
+
+    error = None
+    try:
+        for attempt in range(1, MAX_ATTEMPTS + 1):
+            if job["cancel"]:
+                raise Cancelled()
+
+            job["attempt"] = attempt
+            job["status"] = "downloading"
+            job["message"] = (None if attempt == 1 else
+                              f"Connection dropped — retrying ({attempt}/{MAX_ATTEMPTS})…")
+            # Reset the silence clock; resumed bytes count as progress.
+            job["last_progress"] = time.time()
+            job["last_bytes"] = -1
+
+            try:
+                with yt_dlp.YoutubeDL(build_opts(job, tmp, attempt)) as ydl:
+                    ydl.extract_info(job["url"], download=True)
+                if job["cancel"]:
+                    raise Cancelled()
+                finish_success(job, tmp)
+                return
+
+            except (Cancelled, TimedOut):
+                raise
+
+            except Stalled:
+                error = ("The download stopped moving — the site is likely "
+                         "throttling this server.")
+                if attempt >= MAX_ATTEMPTS:
+                    raise
+                time.sleep(min(3 * attempt, 15))
+
+            except yt_dlp.utils.DownloadError as e:
+                if job["cancel"]:
+                    raise Cancelled()
+                text = str(e).lower()
+                # If the impersonation target is unusable on this host, drop it
+                # and retry immediately rather than failing the whole job.
+                if "impersonate" in text and USE_IMPERSONATE:
+                    USE_IMPERSONATE = False
+                error = clean_error(e)
+                if attempt >= MAX_ATTEMPTS:
+                    raise
+                time.sleep(min(3 * attempt, 15))
+
     except Cancelled:
         job["status"] = "cancelled"
+        job["message"] = None
+    except TimedOut:
+        job["status"] = "error"
+        job["error"] = f"Gave up after {max(1, JOB_TIMEOUT // 60)} minutes."
+    except Stalled:
+        job["status"] = "error"
+        job["error"] = error or "The download stalled."
     except yt_dlp.utils.DownloadError as e:
-        if job["cancel"]:
-            job["status"] = "cancelled"
-        else:
-            msg = str(e).split("ERROR:")[-1].strip()
-            job["status"] = "error"
-            job["error"] = msg[:300] or "Could not download that link."
+        job["status"] = "error"
+        job["error"] = error or clean_error(e)
     except Exception:
         job["status"] = "error"
         job["error"] = "Something went wrong. Try again."
     finally:
+        job["message"] = None
         if job["status"] in ("error", "cancelled"):
             shutil.rmtree(tmp, ignore_errors=True)
             job["tmp"] = None
@@ -167,6 +335,8 @@ def progress():
         percent=job["percent"],
         speed=job["speed"],
         eta=job["eta"],
+        message=job["message"],
+        attempt=job["attempt"],
         filename=job["filename"],
         error=job["error"],
     )
@@ -225,7 +395,17 @@ def sweep_jobs():
         now = time.time()
         with jobs_lock:
             for jid, job in list(jobs.items()):
-                if job["status"] in ("error", "cancelled") and now - job["created"] > JOB_TTL:
+                terminal = job["status"] in ("error", "cancelled")
+                # A finished job that nobody fetched still holds a temp dir on
+                # disk; expire it so the container doesn't fill up.
+                abandoned = (job["status"] == "done"
+                             and job.get("tmp")
+                             and now - job["created"] > JOB_TTL)
+                if (terminal and now - job["created"] > JOB_TTL) or abandoned:
+                    if abandoned and job.get("tmp"):
+                        threading.Thread(
+                            target=rmtree_retry, args=(job["tmp"],), daemon=True
+                        ).start()
                     jobs.pop(jid, None)
 
 

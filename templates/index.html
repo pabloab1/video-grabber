@@ -58,10 +58,10 @@ const $ = id => document.getElementById(id);
 const status = (t, err=false) => { $("status").textContent = t; $("status").className = err ? "err" : ""; };
 
 const POLL_MS = 700;
-const STALL_MS = 300000;  // no movement for 5 min -> warn
+const STALL_MS = 120000;  // warn (do not abort) if nothing moves for 2 min
 
 let job = null, pollTimer = null, cancelling = false;
-let lastStage = "", lastPct = -1, lastMove = 0;
+let lastStage = "", lastPct = -1, lastMove = 0, stalledWarned = false;
 
 function busy(on){
   $("go").disabled = on;
@@ -86,7 +86,7 @@ async function grab(){
   if(!url){ status("Paste a link first.", true); return; }
   busy(true);
   cancelling = false;
-  lastStage = ""; lastPct = -1; lastMove = Date.now();
+  lastStage = ""; lastPct = -1; lastMove = Date.now(); stalledWarned = false;
   status("Starting…");
   try{
     const r = await fetch("/download", {
@@ -131,15 +131,21 @@ async function tick(){
   }
   $("fill").style.width = pct + "%";
 
-  if(j.status === "queued" && pct === 0){
+  if(j.message){
+    // Server-side retry notice takes priority over the generic progress line.
+    status(j.message);
+  }else if(j.status === "queued" && pct === 0){
     status("Fetching video info…");
   }else{
     const extra = [j.speed && "at " + j.speed, j.eta && "ETA " + j.eta].filter(Boolean).join(" · ");
     status("Downloading " + pct.toFixed(1) + "%" + (extra ? " — " + extra : ""));
   }
 
-  if(Date.now() - lastMove > STALL_MS){
-    fail("No progress for 5 minutes — the site may be throttling or blocking this download. You can retry or try another link.");
+  // The server aborts and resumes a stalled transfer on its own, so this is a
+  // warning, not a failure — keep polling so a recovery stays visible.
+  if(Date.now() - lastMove > STALL_MS && !stalledWarned){
+    stalledWarned = true;
+    status("No progress for a while — still retrying. The site may be throttling.", true);
   }
 }
 

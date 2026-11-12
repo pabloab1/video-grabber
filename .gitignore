@@ -1,6 +1,8 @@
 # Windows-only bundled ffmpeg (too big to commit; prod installs via build.sh)
 bin/
 venv/
+.venv/
+.testvenv/
 .env
 
 # Python

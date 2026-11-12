@@ -13,14 +13,45 @@ Paste a video link, get the file. Flask + yt-dlp.
 ## How it works
 
     POST /download  {url}   -> 202 {job} — starts the download in a background thread
-    GET  /progress?job=...   -> JSON {status, percent, speed, eta, filename, error}
+    GET  /progress?job=...   -> JSON {status, percent, speed, eta, message, attempt, filename, error}
     POST /cancel   {job}    -> aborts an in-flight download
     GET  /file?job=...      -> streams the finished file (job + temp dir are then cleaned up)
 
 The UI polls /progress every 700ms and shows a live progress bar with speed and ETA.
-A watchdog surfaces an error if nothing moves for 5 minutes. yt-dlp runs with
-`concurrent_fragment_downloads: 4` so HLS/DASH fragment streams download in parallel
-(single-fragment downloads stall badly on throttled CDNs).
+
+### Surviving mid-download blocks
+
+A download used to die the moment a connection dropped. Now each job:
+
+- retries every request and fragment (10× each) with capped exponential backoff;
+- resumes from the existing `.part` file instead of restarting from zero;
+- keeps partial files between attempts (they are deleted only after every
+  attempt has failed);
+- skips unavailable fragments, so one dead segment can't kill the whole video;
+- uses chunked HTTP GETs (10 MB), so a dropped connection costs one chunk;
+- aborts and resumes an attempt that makes no byte progress for `STALL_SECONDS`;
+- impersonates a real Chrome TLS/HTTP2 fingerprint (curl_cffi), which is what
+  gets past bot checks that reject plain Python clients;
+- falls back from `bv*+ba/b` (separate streams + merge) to a single progressive
+  file on later attempts.
+
+`attempt` and `message` in the progress payload drive the "retrying (2/4)" line
+in the UI.
+
+### Environment variables
+
+| Var | Default | Purpose |
+| --- | --- | --- |
+| `MAX_ATTEMPTS` | 4 | Full download attempts before giving up |
+| `STALL_SECONDS` | 90 | Abort + resume an attempt after this long with no bytes |
+| `JOB_TIMEOUT_SECONDS` | 1800 | Hard cap per job |
+| `FRAG_CONCURRENCY` | 2 | Parallel HLS/DASH fragments (higher is more likely to be rate-limited) |
+| `MAX_FILESIZE_MB` | 500 | Reject anything larger |
+| `YDL_PROXY` | – | Route downloads through a proxy, e.g. `http://user:pass@host:port` |
+| `YDL_COOKIE_FILE` | – | Netscape cookie file for sites that need a login / age check |
+
+Note: a cloud host's IP is often blocked outright by some sites. That is an IP
+reputation issue, not a code one — `YDL_PROXY` or running locally is the fix.
 
 ## Run locally
 
